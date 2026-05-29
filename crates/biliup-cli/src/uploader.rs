@@ -562,7 +562,7 @@ pub async fn upload(
             t as f64 / 1000.,
             total_size as f64 / 1000. / t as f64
         );
-        info!("Bucket: {:?}", uploader.line);
+        info!("uploader: {:?}", uploader);
 
         // 保存断点续传信息
         checkpoint.add_video(video_path, video.clone());
