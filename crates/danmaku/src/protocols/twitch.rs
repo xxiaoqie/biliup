@@ -8,8 +8,6 @@
 //! - Send "PING" heartbeat every 40 seconds
 //! - Parse PRIVMSG for chat messages
 
-use std::time::Duration;
-
 use async_trait::async_trait;
 use regex::Regex;
 
@@ -86,20 +84,17 @@ impl Platform for Twitch {
 
         // IRC registration commands
         let reg_data = vec![
-            RegistrationData::Text(
-                "CAP REQ :twitch.tv/tags twitch.tv/commands twitch.tv/membership".to_string(),
-            ),
-            RegistrationData::Text("PASS SCHMOOPIIE".to_string()),
+            RegistrationData::Text("CAP REQ :twitch.tv/tags twitch.tv/commands".to_string()),
+            RegistrationData::Text("PASS oauth:".to_string()),
             RegistrationData::Text(format!("NICK {}", nick)),
-            RegistrationData::Text(format!("USER {} 8 * :{}", nick, nick)),
             RegistrationData::Text(format!("JOIN #{}", room_id)),
         ];
 
-        Ok(ConnectionInfo::new("wss://irc-ws.chat.twitch.tv").with_registration(reg_data))
+        Ok(ConnectionInfo::new("wss://irc-ws.chat.twitch.tv:443").with_registration(reg_data))
     }
 
     fn heartbeat_config(&self) -> HeartbeatConfig {
-        HeartbeatConfig::text("PING", Duration::from_secs(40))
+        HeartbeatConfig::none()
     }
 
     fn decode_message(&self, msg: &[u8]) -> Result<DecodeResult> {
@@ -108,40 +103,52 @@ impl Platform for Twitch {
             .map_err(|e| crate::error::DanmakuError::Decode(e.to_string()))?;
 
         let mut events = Vec::new();
+        let mut pong = None;
 
         for line in text.lines() {
-            // Skip empty lines
+            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
 
+            // 一个帧里可能有多条以 CRLF 分隔的 IRC 消息：回应 PING 的同时继续
+            // 解析同帧的其余消息，不能提前返回把它们丢掉
+            if line.starts_with("PING") {
+                let pong_target = line.strip_prefix("PING ").unwrap_or(":tmi.twitch.tv");
+                pong = Some(format!("PONG {}", pong_target));
+                continue;
+            }
+
             // Try to parse PRIVMSG
-            if let Some(content_cap) = self.privmsg_regex.captures(line) {
-                if let Some(content) = content_cap.get(1) {
-                    let mut chat = ChatMessage::new(content.as_str().to_string());
+            if let Some(content_cap) = self.privmsg_regex.captures(line)
+                && let Some(content) = content_cap.get(1)
+            {
+                let mut chat = ChatMessage::new(content.as_str().to_string());
 
-                    // Extract display name
-                    if let Some(name_cap) = self.display_name_regex.captures(line) {
-                        if let Some(name) = name_cap.get(1) {
-                            chat = chat.with_name(name.as_str());
-                        }
-                    }
-
-                    // Extract color
-                    if let Some(color_cap) = self.color_regex.captures(line) {
-                        if let Some(color_hex) = color_cap.get(1) {
-                            if let Ok(color) = u32::from_str_radix(color_hex.as_str(), 16) {
-                                chat = chat.with_color(color);
-                            }
-                        }
-                    }
-
-                    events.push(DanmakuEvent::Chat(chat));
+                // Extract display name
+                if let Some(name_cap) = self.display_name_regex.captures(line)
+                    && let Some(name) = name_cap.get(1)
+                {
+                    chat = chat.with_name(name.as_str());
                 }
+
+                // Extract color
+                if let Some(color_cap) = self.color_regex.captures(line)
+                    && let Some(color_hex) = color_cap.get(1)
+                    && let Ok(color) = u32::from_str_radix(color_hex.as_str(), 16)
+                {
+                    chat = chat.with_color(color);
+                }
+
+                events.push(DanmakuEvent::Chat(chat));
             }
         }
 
-        Ok(DecodeResult::with_events(events))
+        let result = DecodeResult::with_events(events);
+        Ok(match pong {
+            Some(pong) => result.with_text_ack(pong),
+            None => result,
+        })
     }
 
     fn is_text_protocol(&self) -> bool {
@@ -184,5 +191,39 @@ mod tests {
         } else {
             panic!("Expected Chat event");
         }
+    }
+
+    /// 一个 WebSocket 帧里可以有多条以 CRLF 分隔的 IRC 消息。修复前遇到 PING
+    /// 立即返回只带 PONG 的结果，同帧里其余的 PRIVMSG 全部被静默丢弃。
+    #[test]
+    fn ping_batched_with_privmsg_keeps_the_chat_messages() {
+        let twitch = Twitch::new();
+        let msg = b"@color=#FF0000;display-name=Alice;user-type= :alice!alice@alice.tmi.twitch.tv PRIVMSG #channel :first\r\n\
+PING :tmi.twitch.tv\r\n\
+@display-name=Bob;user-type= :bob!bob@bob.tmi.twitch.tv PRIVMSG #channel :second\r\n";
+
+        let result = twitch.decode_message(msg).unwrap();
+
+        let contents: Vec<&str> = result
+            .events
+            .iter()
+            .map(|event| match event {
+                DanmakuEvent::Chat(chat) => chat.content.as_str(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(contents, ["first", "second"]);
+        assert!(result.ack_is_text);
+        assert_eq!(result.ack.as_deref(), Some(&b"PONG :tmi.twitch.tv"[..]));
+    }
+
+    #[test]
+    fn lone_ping_is_answered_with_pong() {
+        let result = Twitch::new()
+            .decode_message(b"PING :tmi.twitch.tv\r\n")
+            .unwrap();
+        assert!(result.events.is_empty());
+        assert!(result.ack_is_text);
+        assert_eq!(result.ack.as_deref(), Some(&b"PONG :tmi.twitch.tv"[..]));
     }
 }

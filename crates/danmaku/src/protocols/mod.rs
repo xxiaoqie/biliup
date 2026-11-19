@@ -6,9 +6,10 @@ pub mod bilibili;
 pub mod douyin;
 pub mod douyu;
 pub mod huya;
-pub mod twitch;
 pub mod twitcasting;
+pub mod twitch;
 pub mod wbi;
+pub mod youtube;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -28,11 +29,24 @@ pub enum RegistrationData {
     Binary(Vec<u8>),
 }
 
+/// Connection transport used by a platform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionTransport {
+    /// WebSocket connection.
+    WebSocket,
+    /// Plain TCP connection.
+    Tcp,
+}
+
 /// Connection information for a platform.
 #[derive(Debug, Clone)]
 pub struct ConnectionInfo {
-    /// WebSocket URL to connect to.
+    /// Primary endpoint to connect to.
     pub ws_url: String,
+    /// Fallback endpoints to try if the primary connection fails.
+    pub fallback_ws_urls: Vec<String>,
+    /// Transport used by the configured URLs.
+    pub transport: ConnectionTransport,
     /// Registration packets to send after connecting.
     pub registration_data: Vec<RegistrationData>,
     /// HTTP headers for the WebSocket connection.
@@ -44,9 +58,23 @@ impl ConnectionInfo {
     pub fn new(ws_url: impl Into<String>) -> Self {
         Self {
             ws_url: ws_url.into(),
+            fallback_ws_urls: Vec::new(),
+            transport: ConnectionTransport::WebSocket,
             registration_data: Vec::new(),
             headers: HeaderMap::new(),
         }
+    }
+
+    /// Add fallback WebSocket URLs.
+    pub fn with_fallback_ws_urls(mut self, urls: Vec<String>) -> Self {
+        self.fallback_ws_urls = urls;
+        self
+    }
+
+    /// Use plain TCP transport for the configured endpoints.
+    pub fn with_tcp_transport(mut self) -> Self {
+        self.transport = ConnectionTransport::Tcp;
+        self
     }
 
     /// Add registration data.
@@ -113,6 +141,8 @@ pub struct DecodeResult {
     pub events: Vec<DanmakuEvent>,
     /// Optional acknowledgment packet to send back (e.g., for Douyin).
     pub ack: Option<Vec<u8>>,
+    /// Whether the acknowledgment should be sent as a text WebSocket message.
+    pub ack_is_text: bool,
 }
 
 impl DecodeResult {
@@ -123,12 +153,24 @@ impl DecodeResult {
 
     /// Create a result with events.
     pub fn with_events(events: Vec<DanmakuEvent>) -> Self {
-        Self { events, ack: None }
+        Self {
+            events,
+            ack: None,
+            ack_is_text: false,
+        }
     }
 
-    /// Add an acknowledgment packet.
+    /// Add a binary acknowledgment packet.
     pub fn with_ack(mut self, ack: Vec<u8>) -> Self {
         self.ack = Some(ack);
+        self.ack_is_text = false;
+        self
+    }
+
+    /// Add a text acknowledgment packet.
+    pub fn with_text_ack(mut self, ack: impl Into<String>) -> Self {
+        self.ack = Some(ack.into().into_bytes());
+        self.ack_is_text = true;
         self
     }
 }
@@ -204,6 +246,20 @@ pub trait Platform: Send + Sync {
     fn is_text_protocol(&self) -> bool {
         false
     }
+
+    /// Poll messages for HTTP-polling based platforms.
+    async fn poll_messages(
+        &self,
+        _url: &str,
+        _context: &mut PlatformContext,
+    ) -> Result<Vec<DanmakuEvent>> {
+        Ok(Vec::new())
+    }
+
+    /// Interval between polling requests.
+    fn poll_interval(&self) -> Duration {
+        Duration::from_secs(1)
+    }
 }
 
 /// Create a platform instance based on URL.
@@ -231,6 +287,10 @@ pub fn create_platform(url: &str) -> Result<Box<dyn Platform>> {
 
     if url.contains("live.douyin.com") {
         return Ok(Box::new(douyin::Douyin::new()));
+    }
+
+    if url.contains("youtube.com") || url.contains("youtu.be") {
+        return Ok(Box::new(youtube::YouTube::new()));
     }
 
     Err(DanmakuError::UnsupportedPlatform(url.to_string()))

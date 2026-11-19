@@ -1,6 +1,6 @@
 //! Test Twitch danmaku connection with actual WebSocket
 
-use danmaku::protocols::{twitch::Twitch, Platform, PlatformContext, RegistrationData};
+use danmaku::protocols::{Platform, PlatformContext, RegistrationData, twitch::Twitch};
 use futures::{SinkExt, StreamExt};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
@@ -74,13 +74,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             Ok(result) => {
                                 for event in result.events {
                                     message_count += 1;
-                                    match event {
-                                        danmaku::message::DanmakuEvent::Chat(chat) => {
+                                    if let danmaku::message::DanmakuEvent::Chat(chat) = event {
                                             println!("[弹幕] {}: {}",
                                                 chat.name.as_deref().unwrap_or("Anonymous"),
                                                 chat.content);
-                                        }
-                                        _ => {}
                                     }
                                 }
                             }

@@ -9,17 +9,20 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use regex::Regex;
+use reqwest::header::{HeaderMap, HeaderValue, ORIGIN, REFERER, USER_AGENT};
 use tracing::debug;
 
 use crate::codec::stt;
 use crate::error::{DanmakuError, Result};
-use crate::message::{ChatMessage, DanmakuEvent, EnterMessage, GiftMessage, DEFAULT_COLOR};
+use crate::message::{ChatMessage, DEFAULT_COLOR, DanmakuEvent, EnterMessage, GiftMessage};
 use crate::protocols::{
     ConnectionInfo, DecodeResult, HeartbeatConfig, Platform, PlatformContext, RegistrationData,
 };
 
-/// WebSocket URL for Douyu danmaku.
-const WSS_URL: &str = "wss://danmuproxy.douyu.com:8506/";
+/// TCP endpoints for Douyu danmaku.
+const TCP_URL: &str = "tcp://danmuproxy.douyu.com:8601";
+const FALLBACK_TCP_URL: &str = "tcp://danmuproxy.douyu.com:8602";
+const USER_AGENT_STRING: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
 /// Message type code.
 const MSG_TYPE: u32 = 689; // 0x02b1
@@ -61,6 +64,15 @@ impl Douyu {
         re.captures(url)
             .and_then(|c| c.get(1))
             .map(|m| m.as_str().to_string())
+    }
+
+    /// Build default WebSocket headers.
+    fn default_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ORIGIN, HeaderValue::from_static("https://www.douyu.com"));
+        headers.insert(REFERER, HeaderValue::from_static("https://www.douyu.com"));
+        headers.insert(USER_AGENT, HeaderValue::from_static(USER_AGENT_STRING));
+        headers
     }
 
     /// Build a STT packet with header.
@@ -111,12 +123,12 @@ impl Douyu {
             let body_start = start + 12;
             let body_end = start + 4 + length - 1; // -1 for null terminator
 
-            if body_end > body_start && body_end <= data.len() {
-                if let Ok(text) = std::str::from_utf8(&data[body_start..body_end]) {
-                    if let Some(event) = Self::parse_stt_message(text) {
-                        events.push(event);
-                    }
-                }
+            if body_end > body_start
+                && body_end <= data.len()
+                && let Ok(text) = std::str::from_utf8(&data[body_start..body_end])
+                && let Some(event) = Self::parse_stt_message(text)
+            {
+                events.push(event);
             }
 
             start += 4 + length;
@@ -145,10 +157,10 @@ impl Douyu {
                 if !name.is_empty() {
                     chat = chat.with_name(name);
                 }
-                if let Some(uid_str) = msg.get_str("uid") {
-                    if let Ok(uid) = uid_str.parse::<u64>() {
-                        chat = chat.with_uid(uid);
-                    }
+                if let Some(uid_str) = msg.get_str("uid")
+                    && let Ok(uid) = uid_str.parse::<u64>()
+                {
+                    chat = chat.with_uid(uid);
                 }
 
                 Some(DanmakuEvent::Chat(chat))
@@ -157,7 +169,10 @@ impl Douyu {
                 // Gift message
                 let name = msg.get_str("nn").unwrap_or("").to_string();
                 let gift_name = msg.get_str("gfn").unwrap_or("礼物").to_string();
-                let num: u32 = msg.get_str("gfcnt").and_then(|s| s.parse().ok()).unwrap_or(1);
+                let num: u32 = msg
+                    .get_str("gfcnt")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
                 let uid: u64 = msg.get_str("uid").and_then(|s| s.parse().ok()).unwrap_or(0);
 
                 let content = format!("{}投喂了{}个{}", name, num, gift_name);
@@ -224,14 +239,18 @@ impl Platform for Douyu {
         let join_packet =
             Self::build_packet(&format!("type@=joingroup/rid@={}/gid@=-9999/", room_id));
 
-        Ok(ConnectionInfo::new(WSS_URL).with_registration(vec![
-            RegistrationData::Binary(login_packet),
-            RegistrationData::Binary(join_packet),
-        ]))
+        Ok(ConnectionInfo::new(TCP_URL)
+            .with_fallback_ws_urls(vec![FALLBACK_TCP_URL.to_string()])
+            .with_tcp_transport()
+            .with_registration(vec![
+                RegistrationData::Binary(login_packet),
+                RegistrationData::Binary(join_packet),
+            ])
+            .with_headers(Self::default_headers()))
     }
 
     fn heartbeat_config(&self) -> HeartbeatConfig {
-        HeartbeatConfig::binary(HEARTBEAT.to_vec(), Duration::from_secs(30))
+        HeartbeatConfig::binary(HEARTBEAT.to_vec(), Duration::from_secs(45))
     }
 
     fn decode_message(&self, msg: &[u8]) -> Result<DecodeResult> {
@@ -254,6 +273,22 @@ mod tests {
             Douyu::extract_room_id("https://douyu.com/789"),
             Some("789".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_connection_prefers_tcp_and_exposes_tcp_fallback() {
+        let conn = Douyu::new()
+            .get_connection_info("https://www.douyu.com/9999", &PlatformContext::new())
+            .await
+            .unwrap();
+
+        assert_eq!(conn.ws_url, TCP_URL);
+        assert_eq!(conn.fallback_ws_urls, vec![FALLBACK_TCP_URL.to_string()]);
+        assert_eq!(conn.transport, crate::protocols::ConnectionTransport::Tcp);
+        assert!(matches!(
+            conn.registration_data.as_slice(),
+            [RegistrationData::Binary(_), RegistrationData::Binary(_)]
+        ));
     }
 
     #[test]
