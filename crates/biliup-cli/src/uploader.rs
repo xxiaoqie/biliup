@@ -283,6 +283,7 @@ pub async fn append(
         .await
         .change_context_lazy(|| AppError::Unknown)?;
     studio.videos.append(&mut uploaded_videos);
+    studio.videos.sort_by(|a, b| a.title.cmp(&b.title));
     match submit {
         SubmitOption::App => bilibili
             .edit_by_app(&studio, proxy)
